@@ -16,10 +16,12 @@
  * there may mount many rgw fs 
  */
 static struct rgw_mount_fs {
+	char *connectpath;
 	char *rgw_uid;
 	char *rgw_access_key;
 	char *rgw_secret_key;
 	struct rgw_fs *rgw_fs;
+	int ref;
 	struct rgw_mount_fs *next, *prev;
 } *rgw_mount_fs;
 
@@ -29,21 +31,192 @@ static struct rgw_fs_module {
 	char *cluster;
 	char *init_args;
 	librgw_t rgw;
-} rgw_fs_module;
+} *rgw_fs_module;
+
+static int rgw_set_preopened(const char *connectpath, const char *rgw_uid,
+	const char *rgw_access_key,
+	const char *rgw_secret_key, struct rgw_fs *fs)
+{
+	struct rgw_mount_fs *entry = NULL;
+
+	entry = talloc_zero(NULL, struct rgw_mount_fs);
+	if (!entry) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	entry->connectpath = talloc_strdup(entry, connectpath);
+	if (entry->connectpath == NULL) {
+		talloc_free(entry);
+		errno = ENOMEM;
+		return -1;
+	}
+
+	entry->fs = fs;
+	entry->ref = 1;
+
+	DLIST_ADD(rgw_mount_fs, entry);
+
+	return 0;
+}
+
+static struct rgw_fs *rgw_find_preopened(const char *connectpath)
+{
+	struct rgw_mount_fs *entry = NULL;
+
+	for (entry = rgw_mount_fs; entry; entry = entry->next) {
+		if (strcmp(entry->connectpath, connectpath) == 0)
+		{
+			entry->ref++;
+			return entry->fs;
+		}
+	}
+
+	return NULL;
+}
+
+static void rgw_clear_preopened(struct rgw_fs *fs)
+{
+	struct rgw_mount_fs *entry = NULL;
+
+	for (entry = rgw_mount_fs; entry; entry = entry->next) {
+		if (entry->fs == fs) {
+			if (--entry->ref)
+				return;
+
+			DLIST_REMOVE(rgw_mount_fs, entry);
+
+			rgw_umount(entry->rgw_fs, RGW_UMOUNT_FLAG_NONE);
+			talloc_free(entry);
+		}
+	}
+}
 
 /* Disk Operations */
+static int vfs_rgw_module_load_params(struct vfs_handle_struct *handle)
+{
+	if (!rgw_fs_module) {
+		return -1;
+	}
+	rgw_fs_module->conf_path = lp_parm_const_string(SNUM(handle->conn), "rgw", "config_file", NULL);
+	rgw_fs_module->name = lp_parm_const_string(SNUM(handle->conn), "rgw", "name", NULL);
+	rgw_fs_module->cluster = lp_parm_const_string(SNUM(handle->conn, "rgw", "cluster", NULL));
+	rgw_fs_module->init_args = lp_parm_const_string(SNUM(handle->conn, "rgw", "init_args", NULL));
+	return 0;
+}
+
+static int vfs_rgw_preinit()
+{
+	int rc = 0;
+	char *conf_path = NULL;
+	char *inst_name = NULL;
+	char *cluster = NULL;
+
+	int argc = 1;
+	char *argv[5] = { "vfs_rgw", NULL, NULL, NULL, NULL };
+	int clen;
+
+	if (!rgw_fs_module) {
+		rgw_fs_module = talloc_zero(NULL, struct rgw_fs_module);
+		if (!rgw_fs_module) {
+			return -1;
+		}
+		vfs_rgw_load_params(handle);
+
+		if (rgw_fs_module->conf_path) {
+			clen = strlen(rgw_fs_module.conf_path) + 8;
+			conf_path = (char *) talloc_zero(talloc_tos(), clen);
+			sprintf(conf_path, "--conf=%s",
+				rgw_fs_module->conf_path);
+			argv[argc] = conf_path;
+			++argc;
+		}
+
+		if (rgw_fs_module->name) {
+			clen = strlen(rgw_fs_module->name) + 8;
+			inst_name = (char *) talloc_zero(talloc_tos(), clen);
+			sprintf(inst_name, "--name=%s", rgw_fs_module->name);
+			argv[argc] = inst_name;
+			++argc;
+		}
+
+		if (rgw_fs_module->cluster) {
+			clen = strlen(rgw_fs_module->cluster) + 8;
+			cluster = (char *) talloc_zero(talloc_tos(), clen);
+			sprintf(cluster, "--cluster=%s",
+				rgw_fs_module->cluster);
+			argv[argc] = cluster;
+			++argc;
+		}
+
+		if (rgw_fs_module->init_args) {
+			argv[argc] = rgw_fs_module->init_args;
+			++argc;
+		}
+
+		rc = librgw_create(&rgw_fs_module->rgw, argc, argv);
+		if (rc != 0) {
+			DEBUG(0, ("RGW module: librgw init failed (%d)\n", rc));
+		}
+	}
+	return rc;
+}
 
 static int vfs_rgw_connect(struct vfs_handle_struct *handle,
 			       const char *service,
 			       const char *user)
 {
+	/* Return code */
+	int rc = 0;
 
+	rc = vfs_rgw_preinit();
+	if (rc) {
+		DEBUG(0, ("vfs_rgw_preinit failed (%d)", rc));
+	}
+	struct rgw_fs * fs = rgw_find_preopened(handle->conn->connectpath);
+	if (fs) {
+		goto done;
+	}
+	char *rgw_user_id = lp_parm_const_string(SNUM(handle->conn), "rgw", "uid", NULL);
+	char *rgw_access_key = lp_parm_const_string(SNUM(handle->conn), "rgw", "access_key", NULL);
+	char *rgw_secret_key = lp_parm_const_string(SNUM(handle->conn), "rgw", "secret_key", NULL);
+
+	rc = rgw_mount(rgw_fs_module->rgw,
+			rgw_user_id,
+			rgw_access_key,
+			rgw_secret_key,
+			&fs,
+			RGW_MOUNT_FLAG_NONE);
+	if (rc) {
+		DEBUG(0, ("Unable to mount RGW cluster for %s.", handle->conn->connectpath));
+		goto done;
+	}
+	rc = rgw_set_preopened(handle->conn->connectpath, rgw_user_id, rgw_access_key,
+				rgw_secret_key, fs);
+	if (rc) {
+		DEBUG(0, ("Failed to register path %s", handle->conn->connectpath));
+		goto done;
+	}
+done:
+	if (ret < 0) {
+		if (fs)
+			rgw_umount(fs, RGW_UMOUNT_FLAG_NONE);
+	} else {
+		handle->data = fs;
+	}
+	return rc;
 }
 
 static void vfs_rgw_disconnect(struct vfs_handle_struct *handle)
 {
-
+	//TODO: judge whether there has been not existing fs
+	/* release the library */
+	if (rgw_fs_module.rgw) {
+		librgw_shutdown(rgw_fs_module.rgw);
+	}
+	talloc_free(rgw_fs_module);
 }
+
 static int vfs_rgw_statvfs(struct vfs_handle_struct *handle,
 			       const char *path,
 			       struct vfs_statvfs_struct *vfs_statvfs)
