@@ -1,4 +1,4 @@
-#include "includes.h"
+
 #include "smbd/smbd.h"
 
 #include <include/rados/librgw.h>
@@ -73,6 +73,22 @@ static struct rgw_fs *rgw_find_preopened(const char *connectpath)
 	}
 
 	return NULL;
+}
+
+static bool rgw_last_preopened() {
+	int entry_count = 0;
+	struct rgw_mount_fs *entry = NULL;
+
+	for (entry = rgw_mount_fs; entry; entry = entry->next) {
+		entry_count++;
+		if (entry_count > 1) {
+			return false;
+		}
+	}
+	if (entry->ref > 1) {
+		return false;
+	}
+	return true;
 }
 
 static void rgw_clear_preopened(struct rgw_fs *fs)
@@ -210,11 +226,17 @@ done:
 static void vfs_rgw_disconnect(struct vfs_handle_struct *handle)
 {
 	//TODO: judge whether there has been not existing fs
-	/* release the library */
-	if (rgw_fs_module.rgw) {
-		librgw_shutdown(rgw_fs_module.rgw);
+	bool last_one = false;
+	last_one = rgw_last_preopened();
+	struct rgw_fs * fs = handle->data;
+	rgw_clear_preopened(fs);
+	if (last_one) {
+		/* release the library */
+		if (rgw_fs_module.rgw) {
+			librgw_shutdown(rgw_fs_module.rgw);
+		}
+		talloc_free(rgw_fs_module);	
 	}
-	talloc_free(rgw_fs_module);
 }
 
 static int vfs_rgw_statvfs(struct vfs_handle_struct *handle,
@@ -227,7 +249,32 @@ static int vfs_rgw_statvfs(struct vfs_handle_struct *handle,
 static int vfs_rgw_open(struct vfs_handle_struct *handle,
 			struct smb_filename *smb_fname,
 			files_struct *fsp, int flags, mode_t mode)
-{}
+{
+	//first seek to the real parent rgw_file_handle
+	//such as a/b/c.txt
+	//first find a's file handle under root,
+	//then find b's file handle under a's,
+	//then open c.txt file under b's handle.
+
+	if (flags & O_DIRECTORY) {
+		// glfd = glfs_opendir(handle->data, smb_fname->base_name);
+	} else if (flags & O_CREAT) {
+		glfd = glfs_creat(handle->data, smb_fname->base_name, flags,
+				  mode);
+	} else {
+
+		glfd = glfs_open(handle->data, smb_fname->base_name, flags);
+	}
+
+	if (glfd == NULL) {
+		return -1;
+	}
+	p_tmp = (glfs_fd_t **)VFS_ADD_FSP_EXTENSION(handle, fsp,
+							  glfs_fd_t *, NULL);
+	*p_tmp = glfd;
+	/* An arbitrary value for error reporting, so you know its us. */
+	return 13371337;
+}
 
 static int vfs_rgw_close(struct vfs_handle_struct *handle,
 			     files_struct *fsp)
